@@ -201,9 +201,9 @@ ffplay -fflags nobuffer -flags low_delay -protocol_whitelist file,udp,rtp -i rtp
 
 The Streaming should start as shown below:
 
-![macOsStreaming](C:\Siana\ST67-73_T02_testing\Firmware\STM32N6570-DK\Publishing\Images\macOsStreaming.png)
+<img src="Images\macOsStreaming.png" alt="ffplay on MacOS" style="zoom:90%;" />
 
-![LinuxStreaming](C:\Siana\ST67-73_T02_testing\Firmware\STM32N6570-DK\Publishing\Images\LinuxStreaming.png)
+<img src="Images\linuxStreaming.png" alt="ffplay on Linux" style="zoom:90%;" />
 
 ## __Troubleshooting__
 
