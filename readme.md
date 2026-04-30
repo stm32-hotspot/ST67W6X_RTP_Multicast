@@ -203,7 +203,7 @@ The Streaming should start as shown below:
 
 <img src="Images\macOsStreaming.png" alt="ffplay on MacOS" style="zoom:90%;" />
 
-<img src="Images\linuxStreaming.png" alt="ffplay on Linux" style="zoom:90%;" />
+<img src="Images\LinuxStreaming.png" alt="ffplay on Linux" style="zoom:90%;" />
 
 ## __Troubleshooting__
 
