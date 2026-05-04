@@ -35,7 +35,7 @@ EWARM/*
 .recommenders
 
 # Git ignore tips https://stackoverflow.com/a/16318111/6800618
-STM32CubeIDE/*
+- STM32CubeIDE/*
 !STM32CubeIDE/Application/
 !STM32CubeIDE/.cproject
 !STM32CubeIDE/.project
