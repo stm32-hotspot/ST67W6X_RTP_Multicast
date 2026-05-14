@@ -1,11 +1,9 @@
 /**
  *******************************************************************************
  * @file    camera_app.c
- * @author  SIANA Systems
- * @date    2025
+ * @author  STMicroelectronics
+ * @date    2026
  * @brief   Camera application
- *******************************************************************************
- * <h2><center>© COPYRIGHT 2025 SIANA Systems</center></h2>
  *******************************************************************************
  */
 #include "camera_app.h"
@@ -22,11 +20,6 @@
 #include "stm32n6570_discovery_lcd.h"
 #include "stm32n6xx_ll_venc.h"
 #include "logging.h"
-#if (ENABLE_TOF)
-#include "vl53l5cx_api.h"
-#include "vl53l5cx_plugin_motion_indicator.h"
-#include "vl53l5cx_plugin_detection_thresholds.h"
-#endif
 /* Private tunables ----------------------------------------------------------*/
 
 #define CAMERA_FPS                30U
@@ -95,14 +88,6 @@ typedef struct
   t_encoder_state   state;
 } t_encoder;
 
-/* Private data --------------------------------------------------------------*/
-
-#if (ENABLE_TOF)
-uint8_t 				ToF_status, ToF_loop, ToF_isAlive, ToF_isReady, ToF_i;
-VL53L5CX_Configuration 	Dev;			/* Sensor configuration */
-VL53L5CX_ResultsData 	Results;		/* Results data from VL53L5CX */
-uint8_t streaming_on = 1;
-#endif /* ENABLE_TOF */
 
 /* Common ---------------------------*/
 static EventGroupHandle_t _event;
@@ -147,19 +132,21 @@ static t_encoder          _encoder = { 0 };
 static uint8_t            _encoder_stream[ENCODER_H264_SIZE] ALIGN32 IN_SRAM_UNCACHED;
 static size_t             _encoder_stream_offset;
 
+static volatile bool      _camera_stream_paused = false;
+static volatile bool      _camera_started = false;
+static volatile bool      _pause_request = false;
+static volatile bool      _resume_request = false;
+
 /* Private function ----------------------------------------------------------*/
 
 /* Camera ---------------------------*/
 static int32_t            _camera_init(void);
 static uint8_t            *_camera_get_buffer(uint32_t pipe);
 static int32_t            _camera_set_ipplug(uint32_t pow0, uint32_t pfs0, uint32_t pow1, uint32_t pfs1, uint32_t pow2, uint32_t pfs2);
+static void               _camera_do_pause(void);
+static void               _camera_do_resume(void);
 extern int                CMW_CAMERA_PIPE_FrameEventCallback(uint32_t pipe);
 extern HAL_StatusTypeDef  MX_DCMIPP_ClockConfig(DCMIPP_HandleTypeDef *hdcmipp);
-
-/* Display --------------------------*/
-static int32_t            _display_init(void);
-extern HAL_StatusTypeDef  MX_LTDC_ClockConfig(LTDC_HandleTypeDef *hltdc);
-extern HAL_StatusTypeDef  MX_LTDC_ConfigLayer(LTDC_HandleTypeDef *hltdc, uint32_t layer, MX_LTDC_LayerConfig_t *config);
 
 /* Encoder --------------------------*/
 static int32_t            _encoder_init(void);
@@ -174,7 +161,15 @@ static uint8_t            _encoder_queue_frame(encoded_frame_t *frame);
 
 static QueueHandle_t busy_buffer_queue = NULL;
 
-
+/**
+  * @brief  Main camera application task.
+  * @param  args: Task argument, unused.
+  * @retval None
+  * @note   Initializes camera, optional display, and encoder resources, then
+  *         runs the main frame-processing loop. The loop handles pause/resume
+  *         requests, services camera events, and triggers frame encoding when
+  *         requested.
+  */
 void camera_app(void* args)
 {
   int32_t status;
@@ -212,32 +207,37 @@ void camera_app(void* args)
   /* Run the camera logic (every frame) */
   while (1U)
   {
-#if (ENABLE_TOF)
-			vl53l5cx_get_ranging_data(&Dev, &Results);
-			uint8_t detected = 0;
-			for (uint8_t i = 0; i < 16; i++) {
-				if ((Results.target_status[i] > 4) && (Results.target_status[i] != 255)) {
-					if(Results.distance_mm[i]< 1000){
-						detected++;
-					}
-				}
-			}
+    if (_pause_request)
+    {
+      _pause_request = false;
+      _camera_do_pause();
+    }
 
-			if((streaming_on) && (detected ==0)) {
-				streaming_on = 0;
-				LogDebug("No detection, Streaming off\n");
-				_encoder_stop();
-			} else if(!streaming_on && detected){
-				LogDebug("Detection, Streaming on\n");
-				streaming_on = 1;
-				_encoder_reset();
-				_encoder_start();
-			}
-#endif
+    if (_resume_request)
+    {
+      _resume_request = false;
+      _camera_do_resume();
+    }
 
     xEventGroupWaitBits(_event, EVT_CAMERA_FRAME, pdTRUE, pdFALSE, portMAX_DELAY);
 
-    /* ISP: Adjust image */
+    if (_pause_request)
+    {
+      _pause_request = false;
+      _camera_do_pause();
+    }
+
+    if (_resume_request)
+    {
+      _resume_request = false;
+      _camera_do_resume();
+    }
+
+    /* IMPORTANT:
+     * Even when paused, keep servicing the camera pipeline.
+     * Stopping CMW_CAMERA_Run() while frames/interrupts are still active
+     * may stall the capture path and freeze the application.
+     */
     status = CMW_CAMERA_Run();
     if (status != CMW_ERROR_NONE)
     {
@@ -246,7 +246,31 @@ void camera_app(void* args)
 
     #if APP_SELECTION == APP_STREAM_ST67
     /* VENC: Process frame */
+    if (_camera_stream_paused)
+    {
+      continue;
+    }
+
     status = xEventGroupWaitBits(_event, EVT_CAMERA_ENCODE_REQUEST, pdFALSE, pdFALSE, 0);
+
+    if (_pause_request)
+    {
+      _pause_request = false;
+      _camera_do_pause();
+      continue;
+    }
+
+    if (_resume_request)
+    {
+      _resume_request = false;
+      _camera_do_resume();
+    }
+
+    if (_camera_stream_paused)
+    {
+      continue;
+    }
+
     if (status & EVT_CAMERA_ENCODE_REQUEST)
     {
       /* Encoder: Process frame */
@@ -261,6 +285,13 @@ void camera_app(void* args)
   }
 }
 
+/**
+  * @brief  Waits for the next available camera buffer of the requested type.
+  * @param  buffer: Camera buffer type to wait for.
+  * @param  size: Pointer updated with the returned buffer size in bytes.
+  * @retval Pointer to the selected camera buffer, or NULL if the buffer type is invalid.
+  * @note   This function blocks until the corresponding frame event is received.
+  */
 uint8_t *camera_wait_buffer(t_camera_buffer buffer, size_t *size)
 {
   switch (buffer)
@@ -284,24 +315,57 @@ uint8_t *camera_wait_buffer(t_camera_buffer buffer, size_t *size)
   }
 }
 
+/**
+  * @brief  Requests encoding of the next available camera stream frame.
+  * @param  None
+  * @retval None
+  * @note   Sets the encoder request event bit if the event group is initialized.
+  */
 void camera_encode_request(void)
 {
-  xEventGroupSetBits(_event, EVT_CAMERA_ENCODE_REQUEST);
+  if (_event != NULL)
+  {
+    xEventGroupSetBits(_event, EVT_CAMERA_ENCODE_REQUEST);
+  }
 }
 
+/**
+  * @brief  Waits for an encoded frame to become available in the queue.
+  * @param  None
+  * @retval Pointer to a static copy of the encoded frame descriptor, or NULL if no frame is available.
+  * @note   Uses a finite timeout so the caller can periodically re-evaluate
+  *         pause/resume conditions.
+  */
 encoded_frame_t *camera_encode_wait(void)
 {
-    // Get a copy of the frame from the queue
-    static encoded_frame_t frame;
-    if (xQueuePeek(busy_buffer_queue, &frame, portMAX_DELAY) == pdTRUE) {
-        return &frame;
-    }
+  /* Get a copy of the frame from the queue.
+   * Use a finite timeout so the RTP task can re-check pause/resume requests.
+   */
+  static encoded_frame_t frame;
+
+  if (busy_buffer_queue == NULL)
+  {
     return NULL;
+  }
+
+  if (xQueuePeek(busy_buffer_queue, &frame, pdMS_TO_TICKS(50U)) == pdTRUE)
+  {
+    return &frame;
+  }
+
+  return NULL;
 }
 
 /* Private function definitions ----------------------------------------------*/
 
 /* Camera ---------------------------*/
+/**
+  * @brief  Initializes the camera sensor and both capture pipes.
+  * @param  None
+  * @retval BSP status code.
+  * @note   Configures sensor exposure mode, stream and preview pipes, IPPlug
+  *         bandwidth distribution, and starts continuous acquisition.
+  */
 int32_t _camera_init(void)
 {
   uint32_t  pitch = 0;
@@ -313,15 +377,6 @@ int32_t _camera_init(void)
   {
     return status;
   }
-
-#if (ENABLE_TOF)
-    Dev.platform.address = VL53L5CX_DEFAULT_I2C_ADDRESS;
-    ToF_status = vl53l5cx_is_alive(&Dev, &ToF_isAlive);
-    ToF_status = vl53l5cx_init(&Dev);
-    ToF_status = vl53l5cx_disable_internal_cp(&Dev);
-    ToF_status = vl53l5cx_set_ranging_frequency_hz(&Dev, 30);
-	ToF_status = vl53l5cx_start_ranging(&Dev);
-#endif
 
   status = CMW_CAMERA_SetExposureMode(CMW_EXPOSUREMODE_MANUAL);
   if ((status != CMW_ERROR_NONE) && (status != CMW_ERROR_FEATURE_NOT_SUPPORTED))
@@ -364,12 +419,17 @@ int32_t _camera_init(void)
     return status;
   }
 
-
-
+  _camera_started = true;
+  _camera_stream_paused = false;
 
   return BSP_ERROR_NONE;
 }
 
+/**
+  * @brief  Returns the current memory buffer address associated with a camera pipe.
+  * @param  pipe: DCMIPP pipe identifier.
+  * @retval Pointer to the active pipe buffer, or NULL for an unsupported pipe.
+  */
 static uint8_t *_camera_get_buffer(uint32_t pipe)
 {
   switch (pipe)
@@ -380,6 +440,18 @@ static uint8_t *_camera_get_buffer(uint32_t pipe)
   }
 }
 
+/**
+  * @brief  Configures DCMIPP IPPlug arbitration based on pipe bandwidth usage.
+  * @param  pow0: Width-related contribution for pipe 0.
+  * @param  pfs0: Bytes-per-pixel contribution for pipe 0.
+  * @param  pow1: Width-related contribution for pipe 1.
+  * @param  pfs1: Bytes-per-pixel contribution for pipe 1.
+  * @param  pow2: Width-related contribution for pipe 2.
+  * @param  pfs2: Bytes-per-pixel contribution for pipe 2.
+  * @retval ISP status code.
+  * @note   Computes proportional bandwidth and outstanding transaction values
+  *         for each DCMIPP client.
+  */
 static int32_t _camera_set_ipplug(uint32_t pow0, uint32_t pfs0, uint32_t pow1, uint32_t pfs1, uint32_t pow2, uint32_t pfs2)
 {
   uint32_t client[DCMIPP_NUM_OF_PIPES]= {DCMIPP_CLIENT1, DCMIPP_CLIENT2, DCMIPP_CLIENT5}; /* AXI master client for Dump Pipe, Main Pipe in RGB and Ancillary pipe */
@@ -395,9 +467,9 @@ static int32_t _camera_set_ipplug(uint32_t pow0, uint32_t pfs0, uint32_t pow1, u
   for (size_t idx = 0; idx < DCMIPP_NUM_OF_PIPES; idx++)
   {
     config.Client     = client[idx];
-    config.DPREGStart = config.DPREGEnd? config.DPREGEnd + 1 : 0;
-    config.DPREGEnd   = MIN((config.DPREGStart + 640 * PBP[idx]/PBP_ALL), 639);
-    config.MaxOutstandingTransactions = ((16 * PBP[idx]/PBP_ALL) >= 1)? (16 * PBP[idx]/PBP_ALL) - 1 : 0;
+    config.DPREGStart = config.DPREGEnd ? config.DPREGEnd + 1 : 0;
+    config.DPREGEnd   = MIN((config.DPREGStart + 640 * PBP[idx] / PBP_ALL), 639);
+    config.MaxOutstandingTransactions = ((16 * PBP[idx] / PBP_ALL) >= 1) ? (16 * PBP[idx] / PBP_ALL) - 1 : 0;
     if (HAL_DCMIPP_SetIPPlugConfig(CMW_CAMERA_GetDCMIPPHandle(), &config) != HAL_OK)
     {
       return ISP_ERR_DCMIPP_CONFIGPIPE;
@@ -406,23 +478,92 @@ static int32_t _camera_set_ipplug(uint32_t pow0, uint32_t pfs0, uint32_t pow1, u
   return ISP_OK;
 }
 
+/**
+  * @brief  Applies the internal pause state for the camera streaming/encoding path.
+  * @param  None
+  * @retval None
+  * @note   Clears pending encode requests and marks the stream path as paused
+  *         without fully stopping frame servicing.
+  */
+static void _camera_do_pause(void)
+{
+  if (_event != NULL)
+  {
+    /* Stop new encode requests while paused */
+    xEventGroupClearBits(_event, EVT_CAMERA_ENCODE_REQUEST);
+  }
+
+  _camera_stream_paused = true;
+  _camera_started = false;
+
+  LogInfo("Camera encode path paused\n");
+}
+
+/**
+  * @brief  Resumes the internal camera streaming/encoding path.
+  * @param  None
+  * @retval None
+  * @note   Forces the next encoded frame to be intra-coded and re-arms the
+  *         encoder request event.
+  */
+static void _camera_do_resume(void)
+{
+  /* Force an intra frame after resume */
+  _encoder.forced = 1U;
+
+  _camera_stream_paused = false;
+  _camera_started = true;
+
+  if (_event != NULL)
+  {
+    xEventGroupClearBits(_event, EVT_CAMERA_ENCODE_REQUEST);
+    xEventGroupSetBits(_event, EVT_CAMERA_ENCODE_REQUEST);
+  }
+
+  LogInfo("Camera encode path resumed\n");
+}
+
+/**
+  * @brief  Camera frame event callback executed on pipe frame completion.
+  * @param  pipe: Pipe identifier that generated the frame event.
+  * @retval HAL_OK
+  * @note   Posts preview or stream-related event bits from ISR context and
+  *         triggers a context switch if required.
+  */
 int CMW_CAMERA_PIPE_FrameEventCallback(uint32_t pipe)
 {
-  BaseType_t  woken;
+  BaseType_t  woken = pdFALSE;
   int32_t     status;
+
   switch (pipe)
   {
-    case PREVIEW_PIPE:  status = xEventGroupSetBitsFromISR(_event, EVT_CAMERA_PREVIEW, &woken);                   break;
-    case STREAM_PIPE:   status = xEventGroupSetBitsFromISR(_event, EVT_CAMERA_FRAME | EVT_CAMERA_STREAM, &woken); break;
-    default:            status = pdFAIL;                                                                          break;
+    case PREVIEW_PIPE:
+      status = xEventGroupSetBitsFromISR(_event, EVT_CAMERA_PREVIEW, &woken);
+      break;
+
+    case STREAM_PIPE:
+      status = xEventGroupSetBitsFromISR(_event, EVT_CAMERA_FRAME | EVT_CAMERA_STREAM, &woken);
+      break;
+
+    default:
+      status = pdFAIL;
+      break;
   }
+
   if (status == pdPASS)
   {
     portYIELD_FROM_ISR(woken);
   }
+
   return HAL_OK;
 }
 
+/**
+  * @brief  Configures peripheral clocks required by DCMIPP and CSI.
+  * @param  hdcmipp: Pointer to DCMIPP handle, unused.
+  * @retval HAL status.
+  * @note   Selects and divides internal clock sources for DCMIPP and CSI.
+  */
 HAL_StatusTypeDef MX_DCMIPP_ClockConfig(DCMIPP_HandleTypeDef *hdcmipp)
 {
   RCC_PeriphCLKInitTypeDef  config = { 0 };
@@ -448,91 +589,14 @@ HAL_StatusTypeDef MX_DCMIPP_ClockConfig(DCMIPP_HandleTypeDef *hdcmipp)
   return HAL_OK;
 }
 
-/* Display --------------------------*/
-int32_t _display_init(void)
-{
-  MX_LTDC_LayerConfig_t config = { 0 };
-  int32_t               status;
-
-  /* Initialize the LCD */
-  status = BSP_LCD_Init(0U,  LCD_ORIENTATION_LANDSCAPE);
-  if (status != BSP_ERROR_NONE)
-  {
-    return status;
-  }
-
-  /* Configure background layer (camera image) */
-  config.X0          = (LTDC_WIDTH - camera.preview.output_width) / 2;
-  config.X1          = config.X0 + camera.preview.output_width;
-  config.Y0          = (LTDC_HEIGHT - camera.preview.output_height) / 2;
-  config.Y1          = config.Y1 + camera.preview.output_height;
-  config.PixelFormat = PREVIEW_FORMAT_LTDC;
-  config.Address     = (uint32_t)_camera_preview;
-  status = BSP_LCD_ConfigLayer(0U, LTDC_LAYER_1, &config);
-  if (status != BSP_ERROR_NONE)
-  {
-    return status;
-  }
-  return BSP_ERROR_NONE;
-}
-
-HAL_StatusTypeDef MX_LTDC_ClockConfig(LTDC_HandleTypeDef *hltdc)
-{
-  RCC_PeriphCLKInitTypeDef  config = { 0 };
-  int32_t                   status;
-
-  UNUSED(hltdc);
-
-  /* Configure LTDC clocks
-   * LTDC = IC16 = PLL4 / 32 = 25MHz
-   */
-  config.PeriphClockSelection = RCC_PERIPHCLK_LTDC;
-  config.LtdcClockSelection   = RCC_LTDCCLKSOURCE_IC16;
-  config.ICSelection[RCC_IC16].ClockSelection = RCC_ICCLKSOURCE_PLL4;
-  config.ICSelection[RCC_IC16].ClockDivider   = 32;
-  status = HAL_RCCEx_PeriphCLKConfig(&config);
-  if (status != HAL_OK)
-  {
-    return HAL_ERROR;
-  }
-  return HAL_OK;
-}
-
-HAL_StatusTypeDef MX_LTDC_ConfigLayer(LTDC_HandleTypeDef *hltdc, uint32_t layer, MX_LTDC_LayerConfig_t *config)
-{
-  LTDC_LayerCfgTypeDef  aux = { 0 };
-  int32_t               status;
-
-  /* Configure basics */
-  aux.FBStartAdress   = config->Address;
-  aux.PixelFormat     = config->PixelFormat;
-  aux.WindowX0        = config->X0;
-  aux.WindowX1        = config->X1;
-  aux.WindowY0        = config->Y0;
-  aux.WindowY1        = config->Y1;
-  aux.Alpha           = LTDC_LxCACR_CONSTA;
-  aux.BlendingFactor1 = LTDC_BLENDING_FACTOR1_PAxCA;
-  aux.BlendingFactor2 = LTDC_BLENDING_FACTOR2_PAxCA;
-  aux.ImageWidth      = config->X1 - config->X0;
-  aux.ImageHeight     = config->Y1 - config->Y0;
-  status = HAL_LTDC_ConfigLayer(hltdc, &aux, layer);
-
-  /* Set pitch to match sensor
-   * The LTDC HAL pitch API works with "number of pixel", not "number of bytes".
-   * Hack : temporary set the pixel format to "1 byte per pixel", then configure
-   * the pitch (unit = pixel = byte) and then restore the pixel format
-   */
-  if ((layer == LTDC_LAYER_1) && (_display_pitch != 0U))
-  {
-    uint32_t fmt = hltdc->LayerCfg[layer].PixelFormat;
-    hltdc->LayerCfg[layer].PixelFormat = LTDC_PIXEL_FORMAT_L8;
-    HAL_LTDC_SetPitch(hltdc, _display_pitch, layer);
-    hltdc->LayerCfg[layer].PixelFormat = fmt;
-  }
-  return status;
-}
-
 /* Encoder --------------------------*/
+/**
+  * @brief  Initializes the H.264 encoder instance and runtime parameters.
+  * @param  None
+  * @retval BSP status code.
+  * @note   Configures encoder profile level, preprocessing format, coding
+  *         control, and rate control parameters for the camera stream.
+  */
 static int32_t _encoder_init(void)
 {
   H264EncCodingCtrl       coding  = { 0 };
@@ -554,14 +618,14 @@ static int32_t _encoder_init(void)
    * - H.264 encoder (reduced bitrate)
    * - Prepare for DCMIPP stream pipe encoding
    */
-  _encoder.config.level         = ENCODER_LEVEL;
-  _encoder.config.streamType    = H264ENC_BYTE_STREAM;
-  _encoder.config.viewMode      = H264ENC_BASE_VIEW_SINGLE_BUFFER;
-  _encoder.config.width         = camera.stream.output_width;
-  _encoder.config.height        = camera.stream.output_height;
-  _encoder.config.frameRateNum  = camera.sensor.fps;
-  _encoder.config.frameRateDenom= 1;
-  _encoder.config.refFrameAmount= 1;
+  _encoder.config.level          = ENCODER_LEVEL;
+  _encoder.config.streamType     = H264ENC_BYTE_STREAM;
+  _encoder.config.viewMode       = H264ENC_BASE_VIEW_SINGLE_BUFFER;
+  _encoder.config.width          = camera.stream.output_width;
+  _encoder.config.height         = camera.stream.output_height;
+  _encoder.config.frameRateNum   = camera.sensor.fps;
+  _encoder.config.frameRateDenom = 1;
+  _encoder.config.refFrameAmount = 1;
   status = H264EncInit(&_encoder.config, &_encoder.instance);
   if (status != H264ENC_OK)
   {
@@ -600,16 +664,16 @@ static int32_t _encoder_init(void)
   {
     return BSP_ERROR_COMPONENT_FAILURE;
   }
-  rate.pictureRc   = 1;
-  rate.mbRc        = 1;
-  rate.pictureSkip = 0;
-  rate.hrd         = 0;
-  rate.qpHdr       = ENCODER_QP;
-  rate.qpMin       = 10;
-  rate.qpMax       = 51;
-  rate.gopLen      = camera.sensor.fps;
-  rate.bitPerSecond= ENCODER_BITRATE;
-  rate.intraQpDelta= 0;
+  rate.pictureRc    = 1;
+  rate.mbRc         = 1;
+  rate.pictureSkip  = 0;
+  rate.hrd          = 0;
+  rate.qpHdr        = ENCODER_QP;
+  rate.qpMin        = 10;
+  rate.qpMax        = 51;
+  rate.gopLen       = camera.sensor.fps;
+  rate.bitPerSecond = ENCODER_BITRATE;
+  rate.intraQpDelta = 0;
   status = H264EncSetRateCtrl(_encoder.instance, &rate);
   if (status != H264ENC_OK)
   {
@@ -621,9 +685,17 @@ static int32_t _encoder_init(void)
   return BSP_ERROR_NONE;
 }
 
+/**
+  * @brief  Encodes one camera stream frame into the output bitstream buffer.
+  * @param  None
+  * @retval BSP status code.
+  * @note   Starts the encoder on first use, prepares input/output buffers,
+  *         selects frame type, runs encoding, and queues the resulting frame.
+  */
 static int32_t _encoder_process_frame(void)
 {
   int32_t status;
+  encoded_frame_t frame;
 
   /* Validate */
   if (_encoder.state < ENCODER_INITIALIZED)
@@ -637,31 +709,31 @@ static int32_t _encoder_process_frame(void)
     return _encoder_start();
   }
 
-  encoded_frame_t frame;
   frame.data = _get_next_frame_buffer(&frame.max_size);
   if (frame.data == NULL)
   {
-	  return BSP_ERROR_COMPONENT_FAILURE;
+    return BSP_ERROR_COMPONENT_FAILURE;
   }
 
   /* Prepare buffers */
-  _encoder.input.busLuma      = (ptr_t)_camera_get_buffer(STREAM_PIPE);
-  _encoder.input.pOutBuf      = (u32*)frame.data;
-  _encoder.input.busOutBuf    = (ptr_t)frame.data;
-  _encoder.input.outBufSize   = (u32)frame.max_size;
+  _encoder.input.busLuma       = (ptr_t)_camera_get_buffer(STREAM_PIPE);
+  _encoder.input.pOutBuf       = (u32*)frame.data;
+  _encoder.input.busOutBuf     = (ptr_t)frame.data;
+  _encoder.input.outBufSize    = (u32)frame.max_size;
 
   /* Prepare frame type */
-  _encoder.forced             = _encoder.forced | ((_encoder.frame % camera.sensor.fps) == 0U);
-  _encoder.input.codingType   = _encoder.forced ? H264ENC_INTRA_FRAME : H264ENC_PREDICTED_FRAME;
-  _encoder.input.ipf          = H264ENC_REFERENCE_AND_REFRESH;
-  _encoder.input.ltrf         = H264ENC_NO_REFERENCE_NO_REFRESH;
-  _encoder.input.timeIncrement= 1U;
-  _encoder.forced             = 0U;
+  _encoder.forced              = _encoder.forced | ((_encoder.frame % camera.sensor.fps) == 0U);
+  _encoder.input.codingType    = _encoder.forced ? H264ENC_INTRA_FRAME : H264ENC_PREDICTED_FRAME;
+  _encoder.input.ipf           = H264ENC_REFERENCE_AND_REFRESH;
+  _encoder.input.ltrf          = H264ENC_NO_REFERENCE_NO_REFRESH;
+  _encoder.input.timeIncrement = 1U;
+  _encoder.forced              = 0U;
 
   /* Run encoder process */
   status = H264EncStrmEncode(_encoder.instance, &_encoder.input, &_encoder.output, NULL, NULL, NULL);
   frame.enc_size = _encoder.output.streamSize;
   frame.timestamp = xTaskGetTickCount();
+
   switch (status)
   {
     case H264ENC_FRAME_READY:
@@ -676,8 +748,9 @@ static int32_t _encoder_process_frame(void)
       /* Report ready and continue */
       _encoder.input.codingType = H264ENC_PREDICTED_FRAME;
       xEventGroupSetBits(_event, EVT_CAMERA_ENCODE_READY);
-      if (_encoder_queue_frame(&frame) != BSP_ERROR_NONE) {
-          return BSP_ERROR_BUSY;
+      if (_encoder_queue_frame(&frame) != BSP_ERROR_NONE)
+      {
+        return BSP_ERROR_BUSY;
       }
       break;
 
@@ -697,11 +770,18 @@ static int32_t _encoder_process_frame(void)
   return BSP_ERROR_NONE;
 }
 
+/**
+  * @brief  Starts the H.264 stream and produces the initial stream header data.
+  * @param  None
+  * @retval BSP status code.
+  * @note   Allocates the next output buffer, starts the bitstream, updates the
+  *         encoder state, and queues the produced header/frame payload.
+  */
 static int32_t _encoder_start(void)
 {
   int32_t status;
-
   encoded_frame_t frame;
+
   frame.data = _get_next_frame_buffer(&frame.max_size);
 
   /* Validate */
@@ -714,9 +794,14 @@ static int32_t _encoder_start(void)
     return BSP_ERROR_NONE;
   }
 
+  if (frame.data == NULL)
+  {
+    return BSP_ERROR_COMPONENT_FAILURE;
+  }
+
   /* Configure output buffer (fixed) */
-  _encoder.input.pOutBuf    = (u32*) frame.data;
-  _encoder.input.busOutBuf  = (ptr_t) frame.data;
+  _encoder.input.pOutBuf    = (u32*)frame.data;
+  _encoder.input.busOutBuf  = (ptr_t)frame.data;
   _encoder.input.outBufSize = (u32)frame.max_size;
 
   /* Start the encoder */
@@ -725,15 +810,23 @@ static int32_t _encoder_start(void)
   {
     return BSP_ERROR_COMPONENT_FAILURE;
   }
+
   frame.enc_size = _encoder.output.streamSize;
   frame.timestamp = xTaskGetTickCount();
 
   /* Update state */
   _encoder.state = ENCODER_STARTED;
-  //xEventGroupSetBits(_event, EVT_CAMERA_ENCODE_READY);
+
   return _encoder_queue_frame(&frame);
 }
 
+/**
+  * @brief  Stops the H.264 stream encoder.
+  * @param  None
+  * @retval BSP status code.
+  * @note   Ends the current encoded stream and transitions the encoder back to
+  *         the initialized state.
+  */
 static int32_t _encoder_stop(void)
 {
   int32_t status;
@@ -754,10 +847,18 @@ static int32_t _encoder_stop(void)
   {
     return BSP_ERROR_COMPONENT_FAILURE;
   }
+
   _encoder.state = ENCODER_INITIALIZED;
   return BSP_ERROR_NONE;
 }
 
+/**
+  * @brief  Resets the VENC hardware block.
+  * @param  None
+  * @retval None
+  * @note   Performs a hardware reset sequence with short delays to recover
+  *         from encoder/pipe synchronization failures.
+  */
 static void _encoder_reset(void)
 {
   /* Validate */
@@ -772,47 +873,121 @@ static void _encoder_reset(void)
   __HAL_RCC_VENC_RELEASE_RESET();
   vTaskDelay(pdMS_TO_TICKS(5U));
 }
-static uint8_t* _get_next_frame_buffer(size_t *max_size){
-  if (_encoder_stream_offset > ENCODER_H264_SIZE )
+
+/**
+  * @brief  Returns the next free position in the encoded bitstream buffer.
+  * @param  max_size: Pointer updated with the remaining writable buffer size.
+  * @retval Pointer to the next output location, or NULL if no space remains.
+  */
+static uint8_t* _get_next_frame_buffer(size_t *max_size)
+{
+  if (_encoder_stream_offset > ENCODER_H264_SIZE)
   {
-	  //LogError("no more room for frame buffer");
-	  *max_size = 0;
-	  return NULL;
+    *max_size = 0;
+    return NULL;
   }
+
   *max_size = ENCODER_H264_SIZE - _encoder_stream_offset;
   return _encoder_stream + _encoder_stream_offset;
 }
 
-static uint8_t _encoder_queue_frame(encoded_frame_t *frame) {
+/**
+  * @brief  Queues an encoded frame descriptor for downstream consumption.
+  * @param  frame: Pointer to the encoded frame descriptor to enqueue.
+  * @retval BSP status code.
+  * @note   On success, advances the shared stream buffer offset and aligns it
+  *         to the next 32-byte boundary.
+  */
+static uint8_t _encoder_queue_frame(encoded_frame_t *frame)
+{
+  /* Copy the frame struct into the queue (not pointer) */
+  if (xQueueSend(busy_buffer_queue, frame, 0) == pdTRUE)
+  {
+    taskENTER_CRITICAL();
+    _encoder_stream_offset += frame->enc_size;
+    taskEXIT_CRITICAL();
 
-    // Copy the frame struct into the queue (not pointer)
-    if (xQueueSend(busy_buffer_queue, frame, 0) == pdTRUE) {
-    	//LogDebug("%d: queue: %08X, size=%d, offset=%d\n", xTaskGetTickCount(), frame->data , frame->enc_size, _encoder_stream_offset );
+    /* Align _encoder_stream_offset to next 32-byte boundary */
+    _encoder_stream_offset = (_encoder_stream_offset + 31U) & ~31U;
 
-     	taskENTER_CRITICAL();
-        _encoder_stream_offset += frame->enc_size;
-        taskEXIT_CRITICAL();
-        // Align _encoder_stream_offset to next 32-byte boundary
-        _encoder_stream_offset = (_encoder_stream_offset + 31) & ~31;
-
-        return BSP_ERROR_NONE;
-    } else {
-        return BSP_ERROR_BUSY;
-    }
+    return BSP_ERROR_NONE;
+  }
+  else
+  {
+    return BSP_ERROR_BUSY;
+  }
 }
 
+/**
+  * @brief  Releases the oldest encoded frame from the queue.
+  * @param  None
+  * @retval None
+  * @note   If the queue becomes empty after removal, the encoded stream buffer
+  *         offset is reset to allow reuse from the beginning.
+  */
 void camera_encode_free(void)
 {
-    encoded_frame_t frame;
-    // Remove the frame from the queue (copy out, not pointer)
-    if (xQueueReceive(busy_buffer_queue, &frame, 0) == pdTRUE) {
-        // Free the buffer (if needed)
-    }
-    taskENTER_CRITICAL();
-    // If queue is now empty, reset offset
-    if (uxQueueMessagesWaiting(busy_buffer_queue) == 0) {
-        _encoder_stream_offset = 0;
-    }
-    taskEXIT_CRITICAL();
-    //LogDebug("%d:  free: %08X, size=%d, offset=%d\n", xTaskGetTickCount(), frame.data , frame.enc_size, _encoder_stream_offset );
+  encoded_frame_t frame;
+
+  /* Remove the frame from the queue (copy out, not pointer) */
+  if (xQueueReceive(busy_buffer_queue, &frame, 0) == pdTRUE)
+  {
+    /* Free the buffer (if needed) */
+  }
+
+  taskENTER_CRITICAL();
+  /* If queue is now empty, reset offset */
+  if (uxQueueMessagesWaiting(busy_buffer_queue) == 0U)
+  {
+    _encoder_stream_offset = 0U;
+  }
+  taskEXIT_CRITICAL();
+}
+
+/**
+  * @brief  Requests pause of the camera streaming/encoding path.
+  * @param  None
+  * @retval BSP_ERROR_NONE
+  * @note   The actual pause is handled asynchronously by the camera task loop.
+  */
+int32_t camera_stream_pause(void)
+{
+  _pause_request = true;
+  return BSP_ERROR_NONE;
+}
+
+/**
+  * @brief  Requests resume of the camera streaming/encoding path.
+  * @param  None
+  * @retval BSP_ERROR_NONE
+  * @note   The actual resume is handled asynchronously by the camera task loop.
+  */
+int32_t camera_stream_resume(void)
+{
+  _resume_request = true;
+  return BSP_ERROR_NONE;
+}
+
+/**
+  * @brief  Indicates whether the camera stream path is currently paused.
+  * @param  None
+  * @retval true if paused, false otherwise.
+  */
+bool camera_stream_is_paused(void)
+{
+  return _camera_stream_paused;
+}
+
+/**
+  * @brief  Flushes all pending encoded frames from the queue.
+  * @param  None
+  * @retval None
+  * @note   Iteratively frees queued encoded frames until the queue is empty.
+  */
+void camera_encode_flush(void)
+{
+  while ((busy_buffer_queue != NULL) && (uxQueueMessagesWaiting(busy_buffer_queue) > 0U))
+  {
+    camera_encode_free();
+  }
 }

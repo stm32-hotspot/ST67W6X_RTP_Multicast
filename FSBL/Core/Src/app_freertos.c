@@ -36,7 +36,7 @@
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
 #ifdef USE_FreeRTOS_HEAP_5
-#define HEAP5_SRAM_SIZE     (7U * 128U * 1024U)
+#define HEAP5_SRAM_SIZE     (7U * 128U * 1024U) + (20U * 1024U) // Additional 20k for mbedTLS
 #define HEAP5_PSRAM_SIZE    (4U * 1024U * 1024U)
 #endif /* USE_FreeRTOS_HEAP_5 */
 

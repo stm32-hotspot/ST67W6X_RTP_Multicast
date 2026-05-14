@@ -162,6 +162,20 @@ void EXTI9_IRQHandler(void)
 }
 
 /**
+  * @brief This function handles EXTI Line13 interrupt.
+  */
+void EXTI13_IRQHandler(void)
+{
+  /* USER CODE BEGIN EXTI13_IRQn 0 */
+
+  /* USER CODE END EXTI13_IRQn 0 */
+  HAL_GPIO_EXTI_IRQHandler(GPIO_PIN_13);
+  /* USER CODE BEGIN EXTI13_IRQn 1 */
+
+  /* USER CODE END EXTI13_IRQn 1 */
+}
+
+/**
   * @brief This function handles GPDMA1 Channel 10 global interrupt.
   */
 void GPDMA1_Channel10_IRQHandler(void)

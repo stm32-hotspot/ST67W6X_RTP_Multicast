@@ -1,11 +1,9 @@
 /**
  *******************************************************************************
- * @file		camera_app.h
- * @author  SIANA Systems
- * @date    2025
+ * @file	camera_app.h
+ * @author  STMicroelectronics
+ * @date    2026
  * @brief   Camera application
- *******************************************************************************
- * <h2><center>© COPYRIGHT 2025 SIANA Systems</center></h2>
  *******************************************************************************
  */
 #ifndef _CAMERA_APP_H_
@@ -56,9 +54,13 @@ extern t_camera camera;     /*!< Camera configuration */
  */
 void    camera_app(void* args);
 
-void    camera_encode_request(void);
+int32_t camera_stream_pause(void);
+int32_t camera_stream_resume(void);
+bool camera_stream_is_paused(void);
+void camera_encode_request(void);
 encoded_frame_t *camera_encode_wait(void);
-void camera_encode_free( void );
+void camera_encode_free(void);
+void camera_encode_flush(void);
 
 /*----------------------------------------------------------------------------*/
 #ifdef __cplusplus

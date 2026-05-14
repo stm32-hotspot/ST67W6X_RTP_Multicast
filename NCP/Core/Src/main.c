@@ -79,8 +79,8 @@ extern void HAL_GPIO_EXTI_Falling_Callback(uint16_t pin);
 int main(void)
 {
   /* USER CODE BEGIN 1 */
-  SCB_EnableICache();
-  SCB_EnableDCache();
+  //SCB_EnableICache();
+  //SCB_EnableDCache();
 
   /* USER CODE END 1 */
 

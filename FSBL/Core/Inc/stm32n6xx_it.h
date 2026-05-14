@@ -55,6 +55,7 @@ void SecureFault_Handler(void);
 void DebugMon_Handler(void);
 void EXTI7_IRQHandler(void);
 void EXTI9_IRQHandler(void);
+void EXTI13_IRQHandler(void);
 void GPDMA1_Channel10_IRQHandler(void);
 void GPDMA1_Channel11_IRQHandler(void);
 void TIM6_IRQHandler(void);
